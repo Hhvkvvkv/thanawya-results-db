@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 بوت تليجرام للبحث في نتائج الثانوية العامة المصرية
-يدعم التشغيل على Kaggle / أي سيرفر مع تحميل تلقائي للمكتبات
+يدعم Kaggle / Colab / أي سيرفر
 """
 
 import sys
@@ -9,9 +9,8 @@ import os
 import subprocess
 import importlib
 import logging
-import asyncio
 
-# ========== AUTO INSTALL DEPENDENCIES ==========
+# ========== AUTO INSTALL ==========
 REQUIRED_PACKAGES = ["openpyxl", "requests", "python-telegram-bot"]
 for pkg in REQUIRED_PACKAGES:
     module_name = pkg.replace("-", "_").replace("python_", "")
@@ -19,22 +18,20 @@ for pkg in REQUIRED_PACKAGES:
         importlib.import_module(module_name)
     except ImportError:
         print(f"[*] Installing {pkg}...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
-        except:
+        for flag in [["-q"], ["-q", "--break-system-packages"], ["-q", "--user"]]:
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q", "--break-system-packages"])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg] + flag)
+                print(f"[+] {pkg} installed")
+                break
             except:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q", "--user"])
-        print(f"[+] {pkg} installed")
+                continue
 
-# ========== IMPORTS ==========
 import zipfile
 import xml.etree.ElementTree as ET
 import re
 import tempfile
-import json
 import traceback
+import asyncio
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -42,333 +39,199 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # ========== CONFIG ==========
 BOT_TOKEN = "8914928931:AAGlH8RPbzKX9MV2nYO37ioSlgd5ldzrEns"
 DB_FILENAME = "نتيجة ثانوية عامة نظام حديث.xlsx"
-DB_URL = "https://raw.githubusercontent.com/Hhvkvvkv/thanawya-results-db/main/%D9%86%D8%AA%D9%8A%D8%AC%D8%A9%20%D8%AB%D8%A7%D9%86%D9%88%D9%8A%D8%A9%20%D8%B9%D8%A7%D9%85%D8%A9%20%D9%86%D8%B8%D8%A7%D9%85%20%D8%AD%D8%AF%D9%8A%D8%AB.xlsx"
+# Use 'master' not 'main'
+DB_URL = "https://raw.githubusercontent.com/Hhvkvvkv/thanawya-results-db/master/%D9%86%D8%AA%D9%8A%D8%AC%D8%A9%20%D8%AB%D8%A7%D9%86%D9%88%D9%8A%D8%A9%20%D8%B9%D8%A7%D9%85%D8%A9%20%D9%86%D8%B8%D8%A7%D9%85%20%D8%AD%D8%AF%D9%8A%D8%AB.xlsx"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== DATABASE ==========
+# ========== DB ==========
 class ResultDB:
-    """Handles loading and searching the Excel database"""
-
     def __init__(self):
-        self.names = []       # list of all student names
-        self.path = None      # path to xlsx file
+        self.names = []
+        self.path = None
         self.ready = False
 
     def find_or_download_db(self):
-        """Find existing DB or download from GitHub"""
-        search_paths = [
+        search = [
             os.path.join(os.getcwd(), DB_FILENAME),
             os.path.join(tempfile.gettempdir(), DB_FILENAME),
-            os.path.join("/tmp", DB_FILENAME),
-            os.path.join("/content", DB_FILENAME),  # Colab
-            os.path.join("/kaggle/working", DB_FILENAME),  # Kaggle
+            "/tmp/" + DB_FILENAME,
+            "/kaggle/working/" + DB_FILENAME,
+            "/content/" + DB_FILENAME,
         ]
-
-        for p in search_paths:
+        for p in search:
             if os.path.exists(p):
                 self.path = p
-                print(f"[+] Found DB at: {p}")
                 return True
-
         # Download
-        print("[*] Downloading database from GitHub (~40MB)...")
         try:
             import requests
-            self.path = search_paths[1]  # /tmp
-            r = requests.get(DB_URL, stream=True, timeout=300)
+            self.path = search[1]
+            print("[*] Downloading DB (~40MB)...", flush=True)
+            r = requests.get(DB_URL, stream=True, timeout=600)
             r.raise_for_status()
             with open(self.path, "wb") as f:
-                downloaded = 0
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-            print(f"[+] Downloaded to: {self.path}")
+                for c in r.iter_content(8192):
+                    if c:
+                        f.write(c)
+            print("[+] Downloaded DB", flush=True)
             return True
         except Exception as e:
-            print(f"[-] Download failed: {e}")
+            print(f"[-] Download error: {e}", flush=True)
             return False
 
     def load_names(self):
-        """Load all student names from shared strings XML"""
         if self.ready:
             return True
-
         if not self.path or not os.path.exists(self.path):
             if not self.find_or_download_db():
                 return False
-
-        print("[*] Loading student names...")
         try:
             z = zipfile.ZipFile(self.path)
-            xml_data = z.read("xl/sharedStrings.xml")
+            xml = z.read("xl/sharedStrings.xml")
             z.close()
-
             ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-            root = ET.fromstring(xml_data)
-
+            root = ET.fromstring(xml)
             for si in root.findall(f".//{ns}si"):
-                parts = []
-                for t in si.findall(f".//{ns}t"):
-                    if t.text:
-                        parts.append(t.text)
+                parts = [t.text or "" for t in si.findall(f".//{ns}t")]
                 self.names.append("".join(parts))
-
             self.ready = True
-            print(f"[+] Loaded {len(self.names)} student names")
+            print(f"[+] Loaded {len(self.names)} names", flush=True)
             return True
-
         except Exception as e:
-            print(f"[-] Failed to load DB: {e}")
-            traceback.print_exc()
+            print(f"[-] Load error: {e}", flush=True)
             return False
 
-    def search(self, query):
-        """Search for students by name parts"""
-        parts = query.strip().split()
-        matches = []
-        for idx, name in enumerate(self.names):
-            if all(p in name for p in parts):
-                matches.append((idx, name))
-                if len(matches) >= 15:
+    def search(self, q):
+        parts = q.strip().split()
+        out = []
+        for i, n in enumerate(self.names):
+            if all(p in n for p in parts):
+                out.append((i, n))
+                if len(out) >= 15:
                     break
-        return matches
+        return out
 
-    def get_result(self, name_index):
-        """Get full result row for a student by their name index"""
+    def get_result(self, idx):
         try:
             z = zipfile.ZipFile(self.path)
             sheet = z.read("xl/worksheets/sheet1.xml")
             z.close()
-
-            # Find the row containing this name index in column B
-            search = f'<v>{name_index}</v>'.encode("utf-8")
-            pos = sheet.find(search)
-            if pos == -1:
+            pos = sheet.find(f"<v>{idx}</v>".encode())
+            if pos < 0:
                 return None
-
-            # Extract the full <row> tag
-            row_start = sheet.rfind(b"<row", 0, pos)
-            row_end = sheet.find(b"</row>", pos) + 6
-            if row_start == -1 or row_end == -1:
-                return None
-
-            row_xml = sheet[row_start:row_end].decode("utf-8", errors="replace")
-
-            # Parse row number
-            row_num = ""
-            m = re.search(r'row r="(\d+)"', row_xml)
+            rs = sheet.rfind(b"<row", 0, pos)
+            re2 = sheet.find(b"</row>", pos) + 6
+            xml = sheet[rs:re2].decode("utf-8", errors="replace")
+            out = {}
+            m = re.search(r'row r="(\d+)"', xml)
+            if m: out["row"] = m.group(1)
+            m = re.search(r'<c r="A\d+"><v>([^<]+)</v>', xml)
+            if m: out["seating"] = m.group(1)
+            m = re.search(r'<c r="C\d+"><v>([^<]+)</v>', xml)
             if m:
-                row_num = m.group(1)
-
-            # Parse column A (seating number)
-            seating = ""
-            m = re.search(r'<c r="A\d+"><v>([^<]+)</v>', row_xml)
-            if m:
-                seating = m.group(1)
-
-            # Parse column C (total degree)
-            total = None
-            m = re.search(r'<c r="C\d+"><v>([^<]+)</v>', row_xml)
-            if m:
-                try:
-                    total = float(m.group(1))
-                except:
-                    total = m.group(1)
-
-            # Parse column D (status - shared string index)
-            status = ""
-            m = re.search(r'<c r="D\d+" t="s"><v>(\d+)</v>', row_xml)
+                try: out["total"] = float(m.group(1))
+                except: out["total"] = m.group(1)
+            m = re.search(r'<c r="D\d+" t="s"><v>(\d+)</v>', xml)
             if m:
                 si = int(m.group(1))
-                if si < len(self.names):
-                    status = self.names[si]
-
-            name = self.names[name_index] if name_index < len(self.names) else "?"
-
-            return {
-                "row": row_num,
-                "seating": seating,
-                "name": name,
-                "total": total,
-                "status": status,
-            }
-
-        except Exception as e:
-            logger.exception(f"Error getting result for index {name_index}")
+                out["status"] = self.names[si] if si < len(self.names) else ""
+            out["name"] = self.names[idx] if idx < len(self.names) else "?"
+            return out
+        except:
             return None
 
-    def search_with_results(self, query):
-        """Full search: find matches and return their results"""
-        if not self.ready:
-            if not self.load_names():
-                return None
-
-        matches = self.search(query)
+    def search_results(self, q):
+        if not self.ready and not self.load_names():
+            return None
+        matches = self.search(q)
         if not matches:
             return []
-
-        results = []
-        for idx, _ in matches:
-            r = self.get_result(idx)
+        out = []
+        for i, _ in matches:
+            r = self.get_result(i)
             if r:
-                results.append(r)
-        return results
+                out.append(r)
+        return out
 
-
-# ========== GLOBAL DB INSTANCE ==========
 db = ResultDB()
 
-
-# ========== BOT HANDLERS ==========
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message"""
-    await update.message.reply_text(
-        "🎓 *بوت البحث في نتائج الثانوية العامة*\n\n"
-        "أرسل اسم الطالب للبحث عن نتيجته\n"
-        "مثال: `ناديه محمد عبد المنعم`\n\n"
-        "مدعوم من قاعدة بيانات وزارة التربية والتعليم",
+# ========== HANDLERS ==========
+async def start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await upd.message.reply_text(
+        "🎓 *بوت نتائج الثانوية العامة*\n\n"
+        "أرسل اسم الطالب للبحث\n"
+        "مثال: `ناديه محمد عبد المنعم`",
         parse_mode="Markdown"
     )
 
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search for a student by name"""
-    query = update.message.text.strip()
-    if not query:
-        await update.message.reply_text("❌ من فضلك أدخل اسم الطالب")
+async def search(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = upd.message.text.strip()
+    if not q:
+        await upd.message.reply_text("❌ أدخل اسمًا")
         return
-
-    # Send typing action and initial message
-    await update.message.chat.send_action(action="typing")
-    msg = await update.message.reply_text(
-        f"🔍 جاري البحث عن: `{query}`\n⏳ يرجى الانتظار...",
-        parse_mode="Markdown"
-    )
-
+    await upd.message.chat.send_action(action="typing")
     try:
-        results = db.search_with_results(query)
+        res = db.search_results(q)
     except Exception as e:
-        logger.exception("Search error")
-        await msg.edit_text(f"❌ حدث خطأ:\n`{e}`", parse_mode="Markdown")
+        await upd.message.reply_text(f"❌ خطأ: {e}")
         return
-
-    if results is None:
-        await msg.edit_text("❌ فشل تحميل قاعدة البيانات. حاول مرة أخرى")
+    if res is None:
+        await upd.message.reply_text("❌ فشل تحميل قاعدة البيانات")
         return
-
-    if not results:
-        await msg.edit_text(
-            f"❌ لا توجد نتائج للاسم: `{query}`\n\n"
-            "💡 حاول بصيغة مختلفة\n"
-            "مثال: `محمد رضا`",
+    if not res:
+        await upd.message.reply_text(
+            f"❌ لا توجد نتائج لـ: `{q}`\n💡 جرب اسمًا آخر",
             parse_mode="Markdown"
         )
         return
-
-    # Build response
-    text = f"✅ *نتائج البحث عن:* `{query}`\n\n"
-    for i, r in enumerate(results, 1):
-        name = r.get("name", "?")
-        seating = r.get("seating", "?")
-        total = r.get("total", "?")
-        status = r.get("status", "")
-
-        line = f"*{i}.* {name}\n   🆔 {seating}"
-
-        if isinstance(total, (int, float)):
-            line += f" - المجموع: {total}"
-            pct = (total / 320) * 100
-            line += f" ({pct:.2f}%)"
-        else:
-            if total:
-                line += f" - {total}"
-
-        if status:
-            line += f"\n   📌 {status}"
-
-        line += "\n\n"
-        text += line
-
-    text += "🔹 أرسل اسمًا آخر للبحث"
-
+    text = f"✅ نتائج: `{q}`\n\n"
+    for i, r in enumerate(res, 1):
+        n = r.get("name", "?")
+        s = r.get("seating", "?")
+        t = r.get("total", "?")
+        st = r.get("status", "")
+        text += f"{i}. {n}\n   🆔 {s}"
+        if isinstance(t, (int, float)):
+            text += f" - {t}/320 ({t/320*100:.1f}%)"
+        elif t:
+            text += f" - {t}"
+        if st:
+            text += f" | {st}"
+        text += "\n\n"
     if len(text) > 4000:
-        text = text[:3900] + "\n\n... (اختصار بسبب طول النص)"
+        text = text[:3500] + "\n...(مختصر)"
+    await upd.message.reply_text(text)
 
-    await msg.edit_text(text, parse_mode="Markdown")
+async def help_cmd(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await upd.message.reply_text("📖 أرسل اسم الطالب للبحث عن نتيجته")
 
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help message"""
-    await update.message.reply_text(
-        "📖 *مساعدة البوت*\n\n"
-        "• أرسل *اسم الطالب* للبحث\n"
-        "• مثال: `ناديه محمد عبد المنعم`\n"
-        "• مثال: `محمد رضا`\n"
-        "• مثال: `أحمد السيد`\n\n"
-        "البيانات تشمل:\n"
-        "• الاسم الرباعي\n"
-        "• رقم الجلوس\n"
-        "• المجموع والنسبة المئوية\n"
-        "• حالة النجاح",
-        parse_mode="Markdown"
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors"""
-    logger.error(f"Exception while handling an update: {context.error}")
-
+async def err(upd: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Error: {ctx.error}")
 
 # ========== MAIN ==========
 def main():
-    """Start the bot"""
-    print("=" * 50)
-    print("  🏫 Thanawya Results Telegram Bot")
-    print("=" * 50)
+    print("Starting Thanawya Bot...", flush=True)
+    db.load_names()
 
-    # Pre-load database
-    print("[*] Initializing database...")
-    if db.load_names():
-        print("[+] Database ready!")
-    else:
-        print("[-] Database not available. Bot will try on first search.")
-
-    # Build application
-    print("[*] Starting bot...")
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search))
+    app.add_error_handler(err)
 
-    # Register handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
+    print("Bot running! Press Ctrl+C to stop.", flush=True)
 
-    print("[+] Bot is running! Press Ctrl+C to stop.")
-    print("[+] Open Telegram and send a message to the bot.")
-
+    # Fix for asyncio.run() in running event loop (Kaggle/Colab/Jupyter)
     try:
+        loop = asyncio.get_running_loop()
+        # We're in a running loop (Kaggle/Colab)
+        print("Running in existing event loop...", flush=True)
+        loop.create_task(app.run_polling(allowed_updates=Update.ALL_TYPES))
+    except RuntimeError:
+        # No running loop - normal case
         app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except RuntimeError as e:
-        if "event loop" in str(e).lower():
-            # Kaggle/Colab workaround: use asyncio directly
-            print("[*] Using asyncio workaround for this environment...")
-            asyncio.run(_async_main(app))
-        else:
-            raise
-
-
-async def _async_main(app):
-    """Async entry point for Kaggle/Colab"""
-    async with app:
-        await app.start()
-        print("[+] Bot polling started (async mode)")
-        # Keep running
-        while True:
-            await asyncio.sleep(3600)  # Sleep 1 hour, will be interrupted by Ctrl+C
-
 
 if __name__ == "__main__":
     main()
